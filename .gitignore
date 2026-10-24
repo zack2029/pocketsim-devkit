@@ -1,0 +1,11 @@
+# build output (attach ready-made games to a GitHub release instead)
+build/
+*.simsave
+__pycache__/
+*.pyc
+# local compiler copy
+toolchain/
+# editor / OS clutter
+.vscode/
+.DS_Store
+Thumbs.db
