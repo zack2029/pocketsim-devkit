@@ -6,7 +6,8 @@ psbuild - PocketSim DevKit build tool
   psbuild build  [project_dir] [--debug] [--clean]   compile + pack
   psbuild run    [project_dir] [sim options]          build, then open in pocketsim
   psbuild new    <project_dir> [--title "My Game"]    create a project from the template
-  psbuild info   <file.bin|.mcs|.mcd>                 show what's inside a file / card
+  psbuild new    <project_dir> --target vmu            ... a Dreamcast VMU game (assembly)
+  psbuild info   <file.bin|.mcs|.mcd|.vms|.vmi>       show what's inside a file / card
   psbuild install <file.mcs|.bin> <card.mcd> [--name FILENAME]
                                                        put a program onto a card image
   psbuild img2c  <image.png|.txt> <symbol> [-o out.h] 32x32 image -> C array
@@ -18,8 +19,12 @@ Outputs (in <project>/build/):
   <name>.mcs   single save                  (MemcardRex / MemCARDuino / PS2 tools)
   <name>.mcd   128 KB card with only this file (PCSX-Redux / DuckStation / card writers)
   <name>.elf / .map                         (debugging)
+VMU projects (target = vmu in project.ini) give instead:
+  <name>.vms / .vmi                         (VMU emulators, SD card / DC browser tools)
+  <name>.lst                                (listing: addresses and symbols)
 
-Only needs Python 3.8+ and the Arm GNU Toolchain (arm-none-eabi-gcc).
+Needs Python 3.8+; PocketStation projects also need the Arm GNU Toolchain
+(arm-none-eabi-gcc). VMU projects need nothing else: the assembler is built in.
 """
 import argparse
 import configparser
@@ -38,6 +43,10 @@ SDK = os.path.join(KIT, 'sdk')
 IS_WIN = os.name == 'nt'
 
 DEFAULTS = {
+    'target': 'pocketstation',
+    'description': '',
+    'creator': 'PocketSim DevKit',
+    'vmu_filename': '',
     'name': 'game',
     'title': 'PocketStation Game',
     'filename': '',
@@ -129,6 +138,17 @@ def load_project(pdir):
     for k in DEFAULTS:
         if k in sec:
             cfg[k] = sec[k].strip()
+    cfg['target'] = cfg['target'].lower()
+    if cfg['target'] not in ('pocketstation', 'vmu'):
+        die('project.ini: target must be pocketstation or vmu, not %r' % cfg['target'])
+    if cfg['target'] == 'vmu':
+        if 'sources' not in sec:
+            cfg['sources'] = 'src/*.s'
+        if not cfg['vmu_filename']:
+            cfg['vmu_filename'] = (''.join(c for c in cfg['name'].upper() if c.isalnum()) or 'GAME')[:12]
+        if len(cfg['title']) > 16:
+            print('warning: title %r is longer than the 16 characters the VMU shows' % cfg['title'])
+        return cfg
     if not cfg['filename']:
         ident = ''.join(c for c in cfg['name'].upper() if c.isalnum())[:8]
         cfg['filename'] = (cfg['region'] + cfg['product'] + ident)[:20]
@@ -208,6 +228,8 @@ def build(pdir, debug=None, clean=False, quiet=False):
         shutil.rmtree(bdir)
     odir = os.path.join(bdir, 'obj')
     os.makedirs(odir, exist_ok=True)
+    if cfg['target'] == 'vmu':
+        return build_vmu(cfg, pdir, bdir, quiet)
     gcc = find_gcc()
     objcopy = tool(gcc, 'objcopy')
     name = cfg['name']
@@ -275,6 +297,23 @@ def build(pdir, debug=None, clean=False, quiet=False):
     return os.path.join(bdir, name), cfg
 
 
+def build_vmu(cfg, pdir, bdir, quiet):
+    import vmupack
+    import vmasm
+    print('== %s  (Dreamcast VMU, %s)' % (cfg['title'], cfg['vmu_filename']))
+    srcs = collect_sources(cfg, pdir)
+    bad = [s for s in srcs if not s.lower().endswith(('.s', '.asm', '.i'))]
+    if bad:
+        die('VMU games are written in LC86K assembly (.s files); the VMU has no C compiler '
+            'and only 512 bytes of RAM.\n  not assembly: ' + ', '.join(os.path.relpath(b, pdir) for b in bad))
+    srcs = [s for s in srcs if not s.lower().endswith('.i')]
+    try:
+        base = vmupack.build_vmu(cfg, pdir, bdir, srcs, quiet)
+    except (vmasm.AsmError, ValueError) as e:
+        die(str(e))
+    return base, cfg
+
+
 def read_symbols(nm, elf):
     out = subprocess.run([nm, elf], capture_output=True, text=True).stdout
     syms = {}
@@ -317,6 +356,52 @@ int main(void)
     }
     return 0;   /* back to the PocketStation menu */
 }
+'''
+
+VMU_TEMPLATE_MAIN = r'''; %TITLE% - a Dreamcast VMU game (LC86K assembly)
+; d-pad moves the dot, A beeps, MODE returns to the VMU menu.
+
+        .include "vmu.i"
+
+dot_x   = VM_USER           ; your variables: RAM bank 1 from VM_USER ($14) up to $FF
+dot_y   = VM_USER+1
+
+main:
+        mov     #2, B
+        mov     #1, C
+        mov     #<title, TRL
+        mov     #>title, TRH
+        callf   vm_text
+        mov     #24, dot_x
+        mov     #18, dot_y
+.loop:
+        callf   vm_wait_frame
+        callf   vm_input            ; vm_keys = held, vm_new = just pressed
+        ld      dot_x
+        st      B
+        ld      dot_y
+        st      C
+        callf   vm_pclr             ; erase the dot at its old place
+        bn      vm_keys, KB_LEFT, .nl
+        dec     dot_x
+.nl:    bn      vm_keys, KB_RIGHT, .nr
+        inc     dot_x
+.nr:    bn      vm_keys, KB_UP, .nu
+        dec     dot_y
+.nu:    bn      vm_keys, KB_DOWN, .nd
+        inc     dot_y
+.nd:    bn      vm_new, KB_A, .na
+        mov     #N_C5, ACC
+        mov     #4, B
+        callf   vm_beep
+.na:    ld      dot_x
+        st      B
+        ld      dot_y
+        st      C
+        callf   vm_pset             ; off-screen pixels are simply not drawn
+        br      .loop
+
+title:  .byte   "%TITLE%", 0
 '''
 
 TEMPLATE_ICON = '\n'.join([
@@ -363,6 +448,21 @@ def cmd_new(args):
     name = ''.join(c if c.isalnum() or c in '-_' else '_' for c in os.path.basename(pdir.rstrip('/\\'))) or 'game'
     ident = ''.join(c for c in name.upper() if c.isalnum())[:8] or 'GAME'
     title = args.title or name
+    if args.target == 'vmu':
+        open(os.path.join(pdir, 'project.ini'), 'w').write(
+            '[project]\n'
+            'target      = vmu            ; Dreamcast VMU game (LC86K assembly)\n'
+            'name        = %s\n'
+            'title       = %s            ; shown on the VMU (max 16 chars)\n'
+            'description = %s            ; shown in the Dreamcast file manager (max 32 chars)\n'
+            'icon        = icon.txt       ; 32x32: .txt art (2 colours) or .png (max 16 colours); up to 3, comma separated\n'
+            'icon_delay  = 10             ; animation speed when there are several icon frames\n'
+            'sources     = src/*.s\n' % (name, title[:16], title[:32]))
+        open(os.path.join(pdir, 'icon.txt'), 'w').write(TEMPLATE_ICON + '\n')
+        open(os.path.join(pdir, 'src', 'main.s'), 'w').write(VMU_TEMPLATE_MAIN.replace('%TITLE%', title.upper()[:11]))
+        write_bats(pdir)
+        print('created %s  (edit src\\main.s, then run build.bat or: psbuild run %s)' % (pdir, args.dir))
+        return
     short = ''.join(c for c in title.upper() if c.isalnum() or c == ' ')[:7].strip() or 'HELLO'
     open(os.path.join(pdir, 'project.ini'), 'w').write(
         '[project]\n'
@@ -382,7 +482,7 @@ def cmd_new(args):
 
 
 BAT = r"""@echo off
-rem {what} this PocketStation project (generated by psbuild new)
+rem {what} this project (generated by psbuild new)
 setlocal
 set "KIT=%POCKETSIM_DEVKIT%"
 if "%KIT%"=="" set "KIT={kit}"
@@ -462,7 +562,9 @@ def cmd_doctor(args):
             if not os.path.isfile(tool(gcc, t)):
                 print('            ! %s missing next to gcc' % t); ok = False
     except SystemExit:
+        print('            (only PocketStation projects need it; Dreamcast VMU projects build without it)')
         ok = False
+    print('vmu       : built-in LC86K assembler and VMU simulator (no extra tools needed)')
     print('devkit    : %s' % KIT)
     saved, saved_old = user_env('POCKETSIM_DEVKIT'), user_env('PSKIT')
     env = saved if saved is not None else os.environ.get('POCKETSIM_DEVKIT')
@@ -491,12 +593,16 @@ def cmd_build(args):
 def cmd_run(args, extra):
     base, cfg = build(args.dir, debug=True if args.debug else None, clean=args.clean)
     sim = os.path.join(KIT, 'tools', 'pocketsim.py')
-    cmd = [sys.executable, sim, base + '.bin'] + extra
+    cmd = [sys.executable, sim, base + ('.vms' if cfg['target'] == 'vmu' else '.bin')] + extra
     print('== pocketsim ' + ' '.join(extra))
     sys.exit(subprocess.run(cmd).returncode)
 
 
 def cmd_info(args):
+    if args.file.lower().endswith(('.vms', '.vmi')):
+        import vmupack
+        print(vmupack.describe(args.file))
+        return
     raw = open(args.file, 'rb').read()
     if raw[:2] == b'MC' and len(raw) == pf.CARD_SIZE:
         print('%s: 128 KB memory card image' % args.file)
@@ -569,6 +675,8 @@ def main():
     p.add_argument('dir', nargs='?', default='.')
     p.add_argument('--debug', action='store_true'); p.add_argument('--clean', action='store_true')
     p = sub.add_parser('new'); p.add_argument('dir'); p.add_argument('--title')
+    p.add_argument('--target', choices=('pocketstation', 'vmu'), default='pocketstation',
+                   help='vmu = Dreamcast VMU game in assembly')
     p = sub.add_parser('info'); p.add_argument('file')
     p = sub.add_parser('install'); p.add_argument('file'); p.add_argument('card'); p.add_argument('--name')
     sub.add_parser('doctor', help='check Python, toolchain and simulator setup')

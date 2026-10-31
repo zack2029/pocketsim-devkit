@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT - Copyright (c) 2026 PocketSim DevKit contributors
 """
-pocketsim - a small PocketStation simulator for quick testing (pure Python).
+pocketsim - a small PocketStation and Dreamcast VMU simulator for quick testing (pure Python).
 
   python pocketsim.py game.bin                      open a window
   python pocketsim.py game.mcd                      run the first PocketStation app on a card
+  python pocketsim.py game.vms                      run a Dreamcast VMU game (see vmusim.py)
   python pocketsim.py game.bin --headless --frames 300 --input "60:right,90:fire" \
         --shot 120:a.png --screenshot end.png --wav sound.wav
 
 Keys: arrows = d-pad, Z / X / Space / Enter = FIRE (action button), D = dock/undock, M = mute,
       any key wakes the unit from standby,
       R = restart, F12 = screenshot, Esc = quit.
+VMU:  arrows = d-pad, Z / Space = A, X = B, Enter = MODE, Backspace = SLEEP.
+      Headless button names: up down left right a b mode sleep (fire = a).
 
 It runs your ARM code on an ARM7TDMI interpreter and replaces the Sony kernel with
 Python implementations of the SWI calls (high-level emulation), so no BIOS dump is
@@ -31,6 +34,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import psformat as pf  # noqa: E402
+import vmusim  # noqa: E402
 
 M32 = 0xFFFFFFFF
 FLASH = 0x02000000
@@ -50,6 +54,21 @@ def bcd(n):
 
 
 class PocketStation:
+    width, height = 32, 32
+    btn = BTN
+    keymap = {'Left': 'left', 'Right': 'right', 'Up': 'up', 'Down': 'down',
+              'z': 'fire', 'x': 'fire', 'space': 'fire', 'Return': 'fire'}
+    help = 'arrows: d-pad  Z/Space: fire  D: dock  M: mute  R: restart  F12: shot'
+    colors = ('#1c2418', '#a9b596', '#9aa58a')       # ink, paper, bezel
+    cpu_hz = CPU_HZ[7]
+
+    @property
+    def seconds(self):
+        return self.cycles / CPU_HZ[7]
+
+    def advance_to(self, t):
+        self.run_until(int(t * CPU_HZ[7]))
+
     def __init__(self, image, dir_index=1, save_path=None, quiet=False):
         if len(image) % 4:
             image = image + b'\0' * (4 - len(image) % 4)
@@ -1244,6 +1263,13 @@ class PocketStation:
 # ---------------------------------------------------------------- loading
 def load_program(path):
     raw = open(path, 'rb').read()
+    if path.lower().endswith('.vmi'):
+        vms = os.path.splitext(path)[0] + '.vms'
+        if not os.path.exists(vms):
+            raise SystemExit('%s is only the info file; the game is the .vms next to it' % path)
+        return load_program(vms)
+    if path.lower().endswith('.vms') or vmusim.is_vmu_game(raw):
+        return raw, 'vmu', None
     if raw[:2] == b'MC' and len(raw) == pf.CARD_SIZE:
         for idx, fn, size, blocks in pf.card_files(raw):
             data = pf.card_read_file(raw, blocks, size)
@@ -1257,24 +1283,22 @@ def load_program(path):
     return data, 1, fn
 
 
-def parse_input(spec):
+def parse_input(spec, btn=BTN):
     """'60:right,90:fire+up,120:' -> sorted [(frame, mask)]."""
     out = []
     for part in filter(None, (spec or '').split(',')):
         f, _, keys = part.partition(':')
         mask = 0
         for k in filter(None, keys.split('+')):
-            if k not in BTN:
-                raise SystemExit('unknown button %r (use fire, up, down, left, right)' % k)
-            mask |= BTN[k]
+            if k not in btn:
+                raise SystemExit('unknown button %r (use %s)' % (k, ', '.join(sorted(btn))))
+            mask |= btn[k]
         out.append((int(f), mask))
     return sorted(out)
 
 
 def headless(sim, args):
-    hz = CPU_HZ[7]
-    per_frame = hz // 30
-    script = parse_input(args.input)
+    script = parse_input(args.input, sim.btn)
     shots = {}
     for s in args.shot or []:
         f, _, p = s.partition(':')
@@ -1289,14 +1313,14 @@ def headless(sim, args):
                 sim.irq_check = True
             if args.dock_at is not None and frame == args.dock_at:
                 sim.docked = 1
-            sim.run_until((frame + 1) * per_frame)
+            sim.advance_to((frame + 1) / 30.0)
             if frame in shots:
                 sim.save_png(shots[frame])
-    except SimStop as e:
+    except (SimStop, vmusim.VmuStop) as e:
         status = str(e)
         failed = not sim.exited
     dt = time.time() - t0
-    print('pocketsim: %s  [%.1f s host time, %.1f emulated s]' % (status, dt, sim.cycles / hz))
+    print('pocketsim: %s  [%.1f s host time, %.1f emulated s]' % (status, dt, sim.seconds))
     if sim.tty:
         print('[tty] ' + sim.tty)
     if args.screenshot:
@@ -1421,24 +1445,26 @@ class AudioOut:
 def gui(sim, args, path):
     import tkinter as tk
     player = AudioOut(enabled=not args.mute)
-    hz = CPU_HZ[7]
-    scale = 9
+    W, H = sim.width, sim.height
+    ink, paper, bezel = sim.colors
+    is_vmu = isinstance(sim, vmusim.VMU)
+    scale = 9 if W <= 32 else 7
     root = tk.Tk()
-    root.title('pocketsim - ' + sim.title)
+    root.title('pocketsim - ' + sim.title + ('  (Dreamcast VMU)' if is_vmu else ''))
     root.configure(bg='#2b2d31')
-    cv = tk.Canvas(root, width=32 * scale + 40, height=32 * scale + 40, bg='#d9d9d4', highlightthickness=0)
+    cv = tk.Canvas(root, width=W * scale + 40, height=H * scale + 40, bg='#d9d9d4', highlightthickness=0)
     cv.pack(padx=12, pady=(12, 4))
-    cv.create_rectangle(14, 14, 32 * scale + 26, 32 * scale + 26, fill='#9aa58a', outline='#666')
+    cv.create_rectangle(14, 14, W * scale + 26, H * scale + 26, fill=bezel, outline='#666')
     pix = [[cv.create_rectangle(20 + x * scale, 20 + y * scale, 20 + (x + 1) * scale - 1, 20 + (y + 1) * scale - 1,
-                                fill='#a9b596', outline='') for x in range(32)] for y in range(32)]
+                                fill=paper, outline='') for x in range(W)] for y in range(H)]
     status = tk.Label(root, text='', fg='#ddd', bg='#2b2d31', font=('Consolas', 10), anchor='w', justify='left')
     status.pack(fill='x', padx=12, pady=(0, 10))
-    keys = {'Left': 'left', 'Right': 'right', 'Up': 'up', 'Down': 'down',
-            'z': 'fire', 'x': 'fire', 'space': 'fire', 'Return': 'fire'}
+    keys = sim.keymap
+    BTNS = sim.btn
     held = set()
     tapped = set()          # keys pressed since the last tick, so quick taps are never lost
-    state = {'last': None, 'stopped': None, 'frame': 0, 't0': time.time(), 'cyc0': 0, 'focus': True}
-    sleep_text = cv.create_text(20 + 16 * scale, 20 + 16 * scale, text='', fill='#1c2418',
+    state = {'last': None, 'stopped': None, 'frame': 0, 't0': time.time(), 'sec0': 0.0, 'focus': True}
+    sleep_text = cv.create_text(20 + W // 2 * scale, 20 + H // 2 * scale, text='', fill=ink,
                                 font=('Consolas', 11, 'bold'), justify='center')
 
     def press(e):
@@ -1446,10 +1472,10 @@ def gui(sim, args, path):
         if k in keys:
             held.add(keys[k])
             tapped.add(keys[k])
-        elif k in ('d', 'D'):
+        elif k in ('d', 'D') and not is_vmu:
             sim.docked ^= 1
         elif k in ('r', 'R'):
-            sim.reset(); state['stopped'] = None; state['t0'] = time.time(); state['cyc0'] = 0
+            sim.reset(); state['stopped'] = None; state['t0'] = time.time(); state['sec0'] = 0.0
         elif k == 'F12':
             p = os.path.splitext(path)[0] + '_%d.png' % int(time.time())
             sim.save_png(p); print('saved ' + p)
@@ -1485,31 +1511,31 @@ def gui(sim, args, path):
     def tick():
         mask = 0
         for b in held | tapped:
-            mask |= BTN[b]
+            mask |= BTNS[b]
         tapped.clear()
         sleeping = getattr(sim, 'sleeping', False)
         if sleeping and mask:
             # convenience: any key wakes the simulated unit, even programs built with an
             # older kit whose standby only listened to the action button
-            mask |= BTN['fire']
+            mask |= BTNS['fire']
         sim.buttons = mask
         sim.irq_check = True
         if not state['stopped']:
-            target = state['cyc0'] + int((time.time() - state['t0']) * hz)
-            target = min(target, sim.cycles + hz // 10)      # don't spiral if the host is slow
+            target = state['sec0'] + (time.time() - state['t0'])
+            target = min(target, sim.seconds + 0.1)          # don't spiral if the host is slow
             try:
-                sim.run_until(target)
-            except SimStop as e:
+                sim.advance_to(target)
+            except (SimStop, vmusim.VmuStop) as e:
                 state['stopped'] = str(e)
                 print('pocketsim: ' + state['stopped'])
-            if sim.cycles < target - hz // 20:               # host too slow: resync clock
-                state['t0'] = time.time(); state['cyc0'] = sim.cycles
+            if sim.seconds < target - 0.05:                  # host too slow: resync clock
+                state['t0'] = time.time(); state['sec0'] = sim.seconds
         rows = sim.screen()
         if rows != state['last']:
-            for y in range(32):
-                for x in range(32):
+            for y in range(H):
+                for x in range(W):
                     if state['last'] is None or rows[y][x] != state['last'][y][x]:
-                        cv.itemconfig(pix[y][x], fill='#1c2418' if rows[y][x] else '#a9b596')
+                        cv.itemconfig(pix[y][x], fill=ink if rows[y][x] else paper)
             state['last'] = rows
         player.feed(sim, silent=bool(state['stopped']))
         snd = 'SND' if sim.dac_level() else '   '
@@ -1523,9 +1549,9 @@ def gui(sim, args, path):
         elif sleeping:
             hint = 'STANDBY (saving battery): press any key to wake'
         else:
-            hint = 'arrows: d-pad  Z/Space: fire  D: dock  M: mute  R: restart  F12: shot'
-        text = '%s  %s %s  %s\n%s' % ('DOCKED' if sim.docked else 'handheld', snd, led,
-                                      'sleep' if sleeping else '', hint)
+            hint = sim.help
+        where = 'VMU' if is_vmu else ('DOCKED' if sim.docked else 'handheld')
+        text = '%s  %s %s  %s\n%s' % (where, snd, led, 'sleep' if sleeping else '', hint)
         status.config(text=text)
         root.after(16, tick)
 
@@ -1536,8 +1562,8 @@ def gui(sim, args, path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='PocketStation simulator (HLE kernel, pure Python)')
-    ap.add_argument('file', help='.bin, .mcs or .mcd')
+    ap = argparse.ArgumentParser(description='PocketStation / Dreamcast VMU simulator (HLE, pure Python)')
+    ap.add_argument('file', help='.bin, .mcs or .mcd (PocketStation), .vms (VMU)')
     ap.add_argument('--headless', action='store_true', help='no window; use with --frames')
     ap.add_argument('--frames', type=int, default=300, help='headless: frames (1/30 s) to run')
     ap.add_argument('--input', help='headless: button script, e.g. "30:right,45:,60:fire+up"')
@@ -1551,6 +1577,15 @@ def main():
     args = ap.parse_args()
 
     data, idx, fn = load_program(args.file)
+    if idx == 'vmu':
+        try:
+            sim = vmusim.VMU(data)
+        except ValueError as e:
+            raise SystemExit('pocketsim: %s' % e)
+        if args.headless:
+            sys.exit(headless(sim, args))
+        gui(sim, args, args.file)
+        return
     save = os.path.splitext(args.file)[0] + '.simsave'
     if args.fresh and os.path.exists(save):
         os.remove(save)

@@ -2,10 +2,11 @@
 
 A homebrew SDK for the PocketStation handheld memory card (SCPH-4000): write games in C,
 build them on Windows with one command, test them in the bundled simulator, and put them
-on a real unit.
+on a real unit. It also builds games for the **Dreamcast VMU** (Visual Memory Unit), written
+in assembly, with the same `ps build` / `ps run` workflow (see [section 12](#12-dreamcast-vmu-games)).
 
 > PocketSim DevKit is an independent, community-driven open-source project and is not
-> affiliated with, authorized, or endorsed by Sony Interactive Entertainment.
+> affiliated with, authorized, or endorsed by Sony Interactive Entertainment or SEGA.
 
 Free to use, change and share under the [MIT License](LICENSE).
 
@@ -21,10 +22,17 @@ pocketsim-devkit/
     include/ps/bios.h  kernel calls (SWI 01h-18h)
     src/               crt0, IRQ hook, drawing, font, sound, save code
     ld/                linker script for the MCX0 file layout
+  vmu/
+    include/vmu.i      Dreamcast VMU runtime: RAM map, buttons, notes, calls
+    include/sfr.i      every VMU register
+    lib/vmu.s          VMU runtime: init, frame timer, input, drawing, 3x5 font, buzzer
   tools/
     psbuild.py         build driver, header/icon generator, card image tools
-    pocketsim.py       ARM7TDMI simulator with a high-level kernel
+    pocketsim.py       simulator window / headless runner (PocketStation and VMU)
     psformat.py        memory card formats (.bin / .mcs / .mcd), PNG reader
+    vmasm.py           LC86K (VMU) assembler
+    vmusim.py          VMU simulator core (LC86K CPU, LCD, timers, buzzer)
+    vmupack.py         VMU game packaging (.vms / .vmi, header, icon)
   examples/
     hello/             clock, sprites, sound, standby, debug log
     snake/             a full game with a high score saved to flash
@@ -32,9 +40,11 @@ pocketsim-devkit/
     summit_climb/      "Summit Climb": vertical platformer, smash ice floors and climb
     balloon_siege/     "Balloon Siege": ride a lift, pop raiders' balloons with arrows
     wing_dash/         "Wing Dash": one-button flyer through gaps in stone pillars
+    vmu_snake/         Snake for the Dreamcast VMU, in assembly
 ```
 
-Everything except the compiler is plain Python 3 with no extra packages.
+Everything except the compiler is plain Python 3 with no extra packages. VMU games need no
+compiler at all: the assembler is part of the kit.
 
 ---
 
@@ -59,6 +69,7 @@ ps run examples\tank_battle    :: the tank game
 ps run examples\summit_climb   :: the climbing game
 ps run examples\balloon_siege  :: the balloon shooter
 ps run examples\wing_dash      :: the one-button flyer
+ps run examples\vmu_snake      :: Snake on the Dreamcast VMU
 ps build examples\hello        :: build only
 ps new C:\dev\mygame --title "My Game"
 cd C:\dev\mygame
@@ -374,6 +385,11 @@ Your app keeps running when docked in a PlayStation; it shows the screen upright
 - Snake's sounds (start, eat, speed-up, game over) were also confirmed in another
   PocketStation emulator (pokket-desktop).
 - The `.bin`, `.mcs` and `.mcd` files round-trip through `ps info` and the card tools.
+- VMU: the assembler reproduces a published VMU homebrew binary from its source (the
+  ADVM audio driver demo). vmu_snake was played by a script in pocketsim (eating, growing,
+  speeding up, crashing, game over, best score). It was also run in libevmu, the emulator
+  core of ElysianVMU, which loaded the `.vms` + `.vmi` pair and drew the same screens as
+  pocketsim frame for frame (title, play, food placement, game over, exit).
 
 **Not yet confirmed on real hardware or a BIOS-accurate emulator** (the register docs
 leave these open): the exact frame-timer rate (if your game runs at the wrong speed,
@@ -381,13 +397,127 @@ change `PS_SYSCLK_HZ` in `ps.h`), the best `LCD_MODE` refresh setting, the DAC b
 (the kit's levels work under both documented interpretations), and the mono-icon bit
 order (same as the LCD by design). Please test on a real unit before relying on them.
 
-## 12. References
+## 12. Dreamcast VMU games
+
+The kit can also build games for SEGA's VMU, the memory card with a screen that plugs into
+a Dreamcast controller. A project becomes a VMU project with one line in `project.ini`:
+
+```ini
+[project]
+target      = vmu                 ; Dreamcast VMU game (LC86K assembly)
+name        = vmu_snake           ; output file name
+title       = SNAKE               ; shown on the VMU (max 16 chars)
+description = Snake - PocketSim DevKit demo   ; shown in the Dreamcast file manager (max 32)
+icon        = icon.txt            ; 32x32: .txt art (2 colours) or .png (max 16 colours), up to 3 frames
+icon_delay  = 10                  ; animation speed when there are several frames
+sources     = src/*.s
+vmu_filename =                    ; name on the VMU, max 12 chars (default: from name)
+creator     = PocketSim DevKit    ; creator field of the file header
+```
+
+```bat
+ps new C:\dev\myvmu --target vmu --title "My VMU Game"
+cd C:\dev\myvmu
+run.bat                           :: builds and opens it in pocketsim
+```
+
+**Why assembly?** The VMU has an 8-bit Sanyo LC86K CPU running at about 146 kHz, 512 bytes
+of RAM (half of it for your game) and no C compiler that targets it. Every VMU game is
+written in assembly, so the kit gives you an assembler plus a runtime that does the fiddly
+parts. C projects cannot be retargeted; the build says so if a VMU project lists `.c` files.
+
+What `ps build` does for a VMU project:
+
+- assembles your `src/*.s` with the kit's LC86K assembler (`tools/vmasm.py`; the syntax of
+  the common VMU homebrew assembler, so most existing sources work)
+- adds the startup code: interrupt vectors, the BIOS clock hook at `$130`, the exit hook at
+  `$1F0`, the file header with your titles and icon, and the runtime
+- writes `build\name.vms` (the game), `build\name.vmi` (the info file that goes with it) and
+  `build\name.lst` (every address and symbol, for debugging)
+
+Your code starts at the label `main`, with the runtime already set up. A minimal game:
+
+```asm
+        .include "vmu.i"
+
+x       = VM_USER               ; your variables: RAM bank 1, $14-$FF
+
+main:   mov     #20, x
+.loop:  callf   vm_wait_frame   ; 30 frames per second, sleeps in between
+        callf   vm_input        ; vm_keys = held, vm_new = just pressed; MODE = back to menu
+        ld      x
+        st      B
+        mov     #16, C
+        callf   vm_pclr         ; erase the dot
+        bn      vm_keys, KB_LEFT, .r
+        dec     x
+.r:     bn      vm_keys, KB_RIGHT, .d
+        inc     x
+.d:     ld      x
+        st      B
+        callf   vm_pset         ; draw it again
+        br      .loop
+```
+
+Runtime calls (all with `callf`; the full list with registers is in `vmu/include/vmu.i`):
+
+| Area | Calls |
+|---|---|
+| Frames / input | `vm_wait_frame`, `vm_input` (sets `vm_keys`, `vm_new`; bits `K_UP` ... `K_SLEEP`, bit numbers `KB_*`), `vm_exit` |
+| Drawing (48x32) | `vm_cls`, `vm_pset`, `vm_pclr`, `vm_pxor`, `vm_ptest`, `vm_plot`, `vm_hline`, `vm_fill` (B = x, C = y; `vm_ink` 0 / 1 / 2 = clear / set / invert) |
+| Text | `vm_char`, `vm_text` (string at TRH:TRL), `vm_number` (3x5 font) |
+| Sound | `vm_beep` (ACC = note `N_C3` ... `N_C6`, B = frames; stops by itself), `vm_quiet` |
+| Random | `vm_rand`, `vm_rand_n` |
+
+MODE always returns to the VMU menu and SLEEP blanks the screen until a button is pressed;
+`vm_input` handles both. The frame timer uses HALT between frames, which is what keeps the
+VMU's small coin cells alive.
+
+**Testing.** `ps run` opens VMU games in pocketsim (`sim game.vms` works too). Keys: arrows =
+d-pad, **Z / Space** = A, **X** = B, **Enter** = MODE, **Backspace** = SLEEP, **M** = mute,
+**R** = restart, **F12** = screenshot. Headless runs take the button names `up down left
+right a b mode sleep`:
+
+```bat
+sim examples\vmu_snake\build\vmu_snake.vms --headless --frames 300 --input "20:a,22:,60:down,62:" --ascii --wav snake.wav
+```
+
+pocketsim emulates the CPU, the LCD, both timers, the buzzer and HALT, and stands in for the
+BIOS clock and exit routines, so no BIOS dump is needed. It stops with a message on a stack
+overflow, an invalid opcode or a jump into BIOS code it does not simulate. Flash writes from
+games (BIOS `fm_wrt_ex`) are not simulated. Then check in **ElysianVMU** (open the `.vms`).
+
+**On a real VMU.** A VMU holds one game at a time. Ways to get the `.vms` + `.vmi` pair onto it:
+
+- a Dreamcast with an SD card adapter and a file manager such as DreamShell, which copies
+  VMU files from the SD card to a VMU
+- the Dreamcast web browser downloading the `.vmi` (it fetches the `.vms` named inside it)
+  from a web server you control
+- a VMU-to-VMU copy from a unit that already has the game
+
+**VMU gotchas**
+
+1. **RAM**: games run with RAM bank 1 selected; `$00-$13` belongs to the runtime, `$14-$FF`
+   is yours. The stack lives in bank 0 and holds about 60 nested calls.
+2. **Branch range**: `bz`, `bnz`, `bp`, `bn`, `be`, `bne`, `br` and `dbnz` reach -128..+127
+   bytes. For anything further use `jmpf` (or `brf`); the assembler tells you when a target
+   is out of range.
+3. **Speed**: about 100,000 instructions per second. Draw what changes instead of redrawing
+   the whole screen each frame (vmu_snake only touches the head and tail cells).
+4. **Pitch**: the buzzer divides 5461 Hz, so high notes are only approximate.
+5. **Timing**: games run on the VMU's RC oscillator, which differs a few percent between
+   units, so the 30 fps frame rate is approximate on hardware.
+
+## 13. References
 
 - psx-spx, *Pocketstation* chapter (nocash's register, kernel and file-format reference):
   https://psx-spx.consoledev.net/pocketstation/
 - GBATEK, for ARM7TDMI instruction details: https://problemkaputt.de/gbatek.htm
 - PCSX-Redux PocketStation core and OpenPSK kernel: https://github.com/pcsx-redux/pocketstation
 - MemCARDuino card reader/writer: https://github.com/ShendoXT/memcarduino
+- Marcus Comstedt's VMU pages (hardware, instruction set, file formats): https://mc.pp.se/dc/
+- waterbear (VMU assembler/emulator, instruction reference): https://github.com/wtetzner/waterbear
+- libevmu / ElysianVMU (VMU emulator): https://github.com/gyrovorbis/libevmu
 
 ## License and trademarks
 
@@ -398,10 +528,11 @@ warranty. Games you build with it are yours; the license notice only needs to tr
 copies of the kit's own source.
 
 PocketSim DevKit is an independent, community-driven open-source project and is not
-affiliated with, authorized, or endorsed by Sony Interactive Entertainment.
-"PlayStation" and "PocketStation" are trademarks of Sony Interactive Entertainment Inc.
-and are used here only to describe the hardware the kit targets.
+affiliated with, authorized, or endorsed by Sony Interactive Entertainment or SEGA.
+"PlayStation" and "PocketStation" are trademarks of Sony Interactive Entertainment Inc.;
+"Dreamcast" and "Visual Memory" (VMU) are trademarks of SEGA Corporation. They are used
+here only to describe the hardware the kit targets.
 
-The kit contains no Sony code or BIOS. The simulator replaces the PocketStation kernel
-with its own implementation, and emulators that need the real kernel require a dump from
-your own unit.
+The kit contains no Sony or SEGA code or BIOS. The simulator replaces the PocketStation
+kernel and the VMU BIOS routines with its own implementations, and emulators that need the
+real firmware require a dump from your own unit.
